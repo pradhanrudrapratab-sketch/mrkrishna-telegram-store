@@ -2,7 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const Database = require("better-sqlite3");
-const { Telegraf, Markup } = require("telegraf");
+const { Telegraf, Markup, Input } = require("telegraf");
 const path = require("path");
 const fs = require("fs");
 
@@ -73,11 +73,69 @@ db.exec(`
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS bot_messages (
+    chat_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    persistent INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(chat_id, message_id)
+  );
 `);
 
 const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+
+bot.use(async (ctx, next) => {
+  const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat?.id;
+
+  if (chatId !== undefined) {
+    const currentMessageId = ctx.callbackQuery?.message?.message_id;
+    const oldMessages = db.prepare(
+      "SELECT message_id, persistent FROM bot_messages WHERE chat_id=?"
+    ).all(String(chatId));
+
+    for (const item of oldMessages) {
+      if (item.persistent || item.message_id === currentMessageId) continue;
+
+      try {
+        await ctx.telegram.deleteMessage(chatId, item.message_id);
+      } catch (_) {
+        // Telegram may already have deleted the message.
+      }
+
+      db.prepare(
+        "DELETE FROM bot_messages WHERE chat_id=? AND message_id=?"
+      ).run(String(chatId), item.message_id);
+    }
+  }
+
+  ctx.state = ctx.state || {};
+
+  for (const method of ["reply", "replyWithPhoto"]) {
+    const original = ctx[method].bind(ctx);
+
+    ctx[method] = async (...args) => {
+      const persistent = ctx.state.keepNextBotMessage === true;
+      ctx.state.keepNextBotMessage = false;
+
+      const sent = await original(...args);
+      const messageId = sent?.message_id;
+      const sentChatId = sent?.chat?.id ?? chatId;
+
+      if (messageId && sentChatId !== undefined) {
+        db.prepare(
+          `INSERT OR REPLACE INTO bot_messages(chat_id, message_id, persistent)
+           VALUES(?, ?, ?)`
+        ).run(String(sentChatId), messageId, persistent ? 1 : 0);
+      }
+
+      return sent;
+    };
+  }
+
+  return next();
+});
 
 const now = () => new Date().toISOString();
 const money = (n) => `₹${Number(n).toFixed(2).replace(/\.00$/, "")}`;
@@ -171,8 +229,12 @@ bot.command("beadmin", async (ctx) => {
     return ctx.reply("Admin is already configured. Nobody else can become admin.");
   }
 
+  if (!ADMIN_CLAIM_CODE) {
+    return ctx.reply("Admin claiming is disabled. The owner must configure ADMIN_CLAIM_CODE in the server environment first.");
+  }
+
   const suppliedCode = (ctx.message.text || "").trim().split(/\s+/).slice(1).join(" ");
-  if (ADMIN_CLAIM_CODE && suppliedCode !== ADMIN_CLAIM_CODE) {
+  if (suppliedCode !== ADMIN_CLAIM_CODE) {
     return ctx.reply("Invalid admin claim code.");
   }
 
@@ -401,17 +463,54 @@ bot.action(/^buy:(\d+)$/, async (ctx) => {
 
 bot.action(/^qr:(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
-  const order = db.prepare("SELECT * FROM orders WHERE order_code=? AND user_id=?")
-    .get(ctx.match[1], String(ctx.from.id));
+
+  const order = db.prepare(
+    "SELECT * FROM orders WHERE order_code=? AND user_id=?"
+  ).get(ctx.match[1], String(ctx.from.id));
+
   if (!order) return ctx.reply("Order not found.");
-  if (order.status === "paid") return ctx.reply("This order is already paid and delivered.");
+  if (order.status === "paid") {
+    return ctx.reply("This order is already paid and delivered.");
+  }
+
   try {
-    await ctx.replyWithPhoto(order.qr_link, {
-      caption: `Payment QR\nOrder: ${order.order_code}\nPayable: ${money(order.gateway_amount)}`
+    const response = await fetch(order.qr_link, {
+      headers: { Accept: "image/*" },
+      signal: AbortSignal.timeout(20000)
     });
+
+    if (!response.ok) throw new Error(`QR download HTTP ${response.status}`);
+
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    if (!contentType.startsWith("image/")) {
+      throw new Error("Gateway QR URL did not return an image.");
+    }
+
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!bytes.length || bytes.length > 8 * 1024 * 1024) {
+      throw new Error("QR image is empty or exceeds the 8 MB safety limit.");
+    }
+
+    const extension = contentType.includes("png") ? "png" :
+      contentType.includes("webp") ? "webp" : "jpg";
+
+    ctx.state.keepNextBotMessage = true;
+
+    await ctx.replyWithPhoto(
+      Input.fromBuffer(bytes, `${order.order_code}.${extension}`),
+      {
+        caption:
+          `PAYMENT QR\\nOrder: ${order.order_code}\\nProduct: ${order.product_name}\\nPayable: ${money(order.gateway_amount)}\\n\\nAfter paying, tap Verify Payment.`,
+        ...Markup.inlineKeyboard([
+          [Markup.button.url("Pay Now", order.payment_link)],
+          [Markup.button.callback("Verify Payment", `verify:${order.order_code}`)]
+        ])
+      }
+    );
   } catch (error) {
-    console.error("QR display failed:", error.message);
-    await ctx.reply(`Could not display QR. Open this QR link: ${order.qr_link}`);
+    ctx.state.keepNextBotMessage = false;
+    console.error("QR download/display failed:", error.message);
+    await ctx.reply("Could not download the QR image. Please use the Pay Now button from your order message and try again.");
   }
 });
 
@@ -427,35 +526,56 @@ bot.action(/^verify:(.+)$/, async (ctx) => {
 
   try {
     const result = await gatewayGet(`/cheque?value=${encodeURIComponent(order.transaction_id)}`);
-    if (result.success !== true) {
-      const message = result.error === "TRANSACTION_NOT_FOUND"
-        ? "Payment is not confirmed yet. If you have paid, wait a little and try Verify Payment again."
-        : "Payment is not confirmed yet. Please try again later.";
-      return ctx.reply(message);
+
+    // All fields are mandatory. A generic success:true is NOT payment proof.
+    const returnedTxn = String(result.transaction_id || "");
+    const returnedAmount = Number(result.amount);
+
+    const paymentIsValid =
+      result.success === true &&
+      result.payment_confirmed === true &&
+      result.status === "PAID" &&
+      returnedTxn === String(order.transaction_id) &&
+      Number.isFinite(returnedAmount) &&
+      Math.round(returnedAmount * 100) ===
+        Math.round(Number(order.gateway_amount) * 100);
+
+    if (!paymentIsValid) {
+      const looksLikeMismatch =
+        result.success === true &&
+        (result.payment_confirmed === true || result.status === "PAID");
+
+      return ctx.reply(
+        looksLikeMismatch
+          ? "Payment details could not be securely matched with this order. Please contact support."
+          : "Payment is not confirmed yet. If you have paid, wait a little and tap Verify Payment again."
+      );
     }
 
-    // If the gateway includes these fields, validate them. The /cheque endpoint
-    // is queried using this exact transaction ID; never trust a client-supplied ID.
-    const returnedTxn = result.transaction_id || result.txn_id || result.order_id;
-    if (returnedTxn && String(returnedTxn) !== String(order.transaction_id)) {
-      return ctx.reply("Transaction verification mismatch. Please contact support.");
-    }
-    const returnedAmount = Number(result.amount ?? result.paid_amount ?? result.received_amount);
-    if (Number.isFinite(returnedAmount) && returnedAmount > 0 &&
-        Math.abs(returnedAmount - Number(order.gateway_amount)) > 0.001) {
-      return ctx.reply("The received amount does not match this order. Please contact support.");
+    // Check the saved delivery URL before marking the order as paid.
+    const stored = db.prepare(
+      "SELECT link FROM order_links WHERE order_code=?"
+    ).get(order.order_code);
+
+    if (!stored?.link) {
+      console.error("Paid transaction has no stored delivery URL:", order.order_code);
+      return ctx.reply("Payment appears confirmed, but the delivery link needs recovery. Please contact support.");
     }
 
     const complete = db.transaction(() => {
-      const fresh = db.prepare("SELECT status FROM orders WHERE order_code=?").get(order.order_code);
+      const fresh = db.prepare(
+        "SELECT status FROM orders WHERE order_code=?"
+      ).get(order.order_code);
+
       if (!fresh || fresh.status === "paid") return false;
-      db.prepare("UPDATE orders SET status='paid', delivered_at=? WHERE order_code=?")
-        .run(now(), order.order_code);
-      return true;
+
+      return db.prepare(
+        "UPDATE orders SET status='paid', delivered_at=? WHERE order_code=? AND status='pending'"
+      ).run(now(), order.order_code).changes > 0;
     });
+
     const didDeliver = complete();
 
-    const stored = db.prepare("SELECT link FROM order_links WHERE order_code=?").get(order.order_code);
     if (!stored?.link) {
       console.error("Paid order missing stored delivery URL:", order.order_code);
       return ctx.reply("Payment verified, but the delivery link needs recovery. Please contact support.");
