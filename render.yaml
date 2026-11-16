@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: mrkrishna-telegram-store
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: PAYMENT_GATEWAY_BASE
+        value: https://mrkrishna-payment-api.onrender.com
+      - key: DATABASE_PATH
+        value: /var/data/store.sqlite
+      - key: PORT
+        value: 10000
+      - key: BOT_TOKEN
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: ADMIN_CLAIM_CODE
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+    # For persistent SQLite storage, attach a Render persistent disk:
+    # disk:
+    #   name: store-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
